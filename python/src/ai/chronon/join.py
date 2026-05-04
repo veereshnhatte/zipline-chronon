@@ -15,6 +15,7 @@
 import copy
 import gc
 import importlib
+import json
 import logging
 from collections import Counter
 from typing import Dict, List, Optional, Union
@@ -290,6 +291,7 @@ def Join(
     step_days: int = None,
     enable_stats_compute: bool = None,
     modular_execution: bool = False,
+    **kwargs,
 ) -> api.Join:
     """
     Construct a join object. A join can pull together data from various GroupBy's both offline and online. This is also
@@ -475,6 +477,8 @@ def Join(
         enableStatsCompute=enable_stats_compute,
     )
 
+    custom_json = json.dumps(kwargs) if kwargs else None
+
     metadata = api.MetaData(
         online=online,
         production=production,
@@ -485,6 +489,7 @@ def Join(
         consistencySamplePercent=consistency_sample_percent,
         executionInfo=exec_info,
         version=str(version) if version is not None else None,
+        customJson=custom_json,
     )
 
     join = api.Join(

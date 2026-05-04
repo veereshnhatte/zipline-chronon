@@ -181,6 +181,7 @@ def StagingQuery(
     step_days: Optional[int] = None,
     recompute_days: Optional[int] = None,
     additional_partitions: List[str] = None,
+    **kwargs,
 ) -> ttypes.StagingQuery:
     """
     Creates a StagingQuery object for executing arbitrary SQL queries with templated date parameters.
@@ -305,7 +306,10 @@ def StagingQuery(
                     "Dependencies must be either TableDependency instances or dictionaries."
                 )
 
-    custom_json = json.dumps({AIRFLOW_DEPENDENCIES_KEY: airflow_dependencies})
+    custom_json_dict = {AIRFLOW_DEPENDENCIES_KEY: airflow_dependencies}
+    if kwargs:
+        custom_json_dict.update(kwargs)
+    custom_json = json.dumps(custom_json_dict)
 
     # Create metadata
     meta_data = ttypes.MetaData(

@@ -497,6 +497,7 @@ def GroupBy(
     cluster_conf: common.ClusterConfigProperties = None,
     step_days: int = None,
     disable_historical_backfill: bool = False,
+    **kwargs,
 ) -> ttypes.GroupBy:
     """
 
@@ -712,6 +713,8 @@ def GroupBy(
                 for output_col in get_output_col_names(agg):
                     column_tags[output_col] = agg.tags
 
+    custom_json = json.dumps(kwargs) if kwargs else None
+
     metadata = ttypes.MetaData(
         online=online,
         production=production,
@@ -722,6 +725,7 @@ def GroupBy(
         tags=tags if tags else None,
         columnTags=column_tags if column_tags else None,
         version=str(version) if version is not None else None,
+        customJson=custom_json,
     )
 
     group_by = ttypes.GroupBy(
