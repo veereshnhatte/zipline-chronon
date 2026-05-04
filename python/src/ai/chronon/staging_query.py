@@ -306,6 +306,10 @@ def StagingQuery(
                     "Dependencies must be either TableDependency instances or dictionaries."
                 )
 
+    if kwargs and AIRFLOW_DEPENDENCIES_KEY in kwargs:
+        raise ValueError(
+            f"'{AIRFLOW_DEPENDENCIES_KEY}' is a reserved key and cannot be passed as a kwarg."
+        )
     custom_json_dict = {AIRFLOW_DEPENDENCIES_KEY: airflow_dependencies}
     if kwargs:
         custom_json_dict.update(kwargs)
