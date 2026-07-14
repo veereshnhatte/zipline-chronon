@@ -56,6 +56,7 @@ class EmrServerlessSubmitterTest extends AnyFlatSpec with Matchers with MockitoS
       awsRegion: String = "us-east-1",
       eksClusterName: Option[String] = None,
       ingressBaseUrl: Option[String] = None,
+      flinkUiProxyEnabled: Boolean = false,
       emrStudioId: Option[String] = None,
       applicationName: String = "test-app",
       kvStoreApiProperties: Map[String, String] = Map(
@@ -71,6 +72,7 @@ class EmrServerlessSubmitterTest extends AnyFlatSpec with Matchers with MockitoS
       awsRegion = awsRegion,
       eksClusterName = eksClusterName,
       ingressBaseUrl = ingressBaseUrl,
+      flinkUiProxyEnabled = flinkUiProxyEnabled,
       emrStudioId = emrStudioId,
       applicationName = applicationName,
       kvStoreApiProperties = kvStoreApiProperties,
@@ -692,6 +694,18 @@ class EmrServerlessSubmitterTest extends AnyFlatSpec with Matchers with MockitoS
     assertEquals("https://hub.example.com/flink/my-deploy/", url.get)
   }
 
+  it should "return services proxy Flink UI URL when Flink UI proxy mode is enabled" in {
+    val mockClient = mock[EmrServerlessClient]
+    val submitter = createSubmitter(
+      mockClient,
+      ingressBaseUrl = Some("https://hub.example.com/services/hub"),
+      flinkUiProxyEnabled = true
+    )
+    val url = submitter.getFlinkUrl("flink:my-ns:my-deploy")
+    assert(url.isDefined)
+    assertEquals("https://hub.example.com/services/hub/engines/flink/job/my-deploy", url.get)
+  }
+
   it should "return None for getFlinkUrl on non-flink job" in {
     val mockClient = mock[EmrServerlessClient]
     val submitter = createSubmitter(mockClient, ingressBaseUrl = Some("https://hub.example.com"))
@@ -885,7 +899,7 @@ class EmrServerlessSubmitterTest extends AnyFlatSpec with Matchers with MockitoS
     result shouldBe JobStatusType.PENDING
   }
 
-  it should "pass the flink URL derived from ingressBaseUrl to the health check fn" in {
+  it should "pass the jobId to the health check fn" in {
     val mockClient = mock[EmrServerlessClient]
     val mockFlinkSubmitter = mock[K8sFlinkSubmitter]
     when(mockFlinkSubmitter.statusWithCreationTime("my-deployment", "zipline-flink"))
@@ -897,12 +911,11 @@ class EmrServerlessSubmitterTest extends AnyFlatSpec with Matchers with MockitoS
       executionRoleArn = "arn:aws:iam::123456789012:role/TestRole",
       s3LogUri = "s3://test-bucket/logs/",
       eksFlinkSubmitter = Some(mockFlinkSubmitter),
-      ingressBaseUrl = Some("https://hub.example.com"),
       flinkHealthCheckFn = url => { capturedUrl = url; true }
     )
     submitter.status("flink:zipline-flink:my-deployment")
 
-    capturedUrl shouldBe Some("https://hub.example.com/flink/my-deployment/")
+    capturedUrl shouldBe Some("flink:zipline-flink:my-deployment")
   }
 
   it should "propagate non-RUNNING EKS status without invoking health check" in {

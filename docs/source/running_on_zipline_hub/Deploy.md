@@ -17,6 +17,8 @@ Deploys the online components of a single entity in a one-off manner. Useful for
 zipline hub run-adhoc --end-ds 2026-04-05 compiled/group_bys/aws/user_activities.v1__1
 ```
 
+After a workflow run is created, you can monitor it in the Zipline Hub UI or poll the [Workflow Status API](/docs/running_on_zipline_hub/Workflow_Status_API).
+
 ### [schedule](/docs/reference/cli#zipline-hub-schedule)
 
 Schedules a single `GroupBy` or `Join` for recurring execution. This ensures the relevant online and offline jobs run daily, and keeps any streaming job alive by restarting it on failure.
@@ -24,6 +26,9 @@ Schedules a single `GroupBy` or `Join` for recurring execution. This ensures the
 ```bash
 zipline hub schedule compiled/group_bys/aws/user_activities.v1__1
 ```
+
+For schedule syntax, output partition cadence, and sub-daily semantics, see
+[Schedules](/docs/authoring_features/Schedules).
 
 ### [schedule-all](/docs/reference/cli#zipline-hub-schedule-all)
 

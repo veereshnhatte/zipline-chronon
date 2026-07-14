@@ -197,7 +197,16 @@ class Join(joinConf: api.Join,
       val partTable = joinConfCloned.partOutputTable(joinPart)
       val effectiveRange =
         if (joinConfCloned.left.dataModel != ENTITIES && joinPart.groupBy.inferredAccuracy == Accuracy.SNAPSHOT) {
-          leftRange.shift(-1)
+          val partSpec = JoinUtils.partSnapshotSpec(joinPart)
+          if (partSpec.hasSameGrid(joinOutputSpec)) {
+            // Same-grid snapshot parts keep the historical behavior: read one partition back.
+            JoinUtils.snapshotLookbackRange(leftRange, partSpec)
+          } else {
+            // Cross-grid snapshot part tables are partitioned exactly like the join output -
+            // one ds per join partition, each row's snapshot time in `ts` - so read the
+            // requested range as-is.
+            leftRange
+          }
         } else {
           leftRange
         }
@@ -261,7 +270,7 @@ class Join(joinConf: api.Join,
 
     }
 
-    val bootStrapWithStats = bootstrapDf.withStats
+    val bootStrapWithStats = DfWithStats(bootstrapDf)(leftRange.partitionSpec)
 
     // for each join part, find the bootstrap sets that can fully "cover" the required fields. Later we will use this
     // info to filter records that need backfills vs can be waived from backfills
@@ -306,7 +315,7 @@ class Join(joinConf: api.Join,
               Option(selectsMap).isDefined && selectsMap.values.exists(_.contains(Constants.ChrononRunDs)))
           ) {
             assert(
-              leftRange.isSingleDay,
+              leftRange.isSinglePartition,
               s"Macro ${Constants.ChrononRunDs} is only supported for single day join, current range is $leftRange")
           }
 
@@ -323,20 +332,30 @@ class Join(joinConf: api.Join,
             joinLevelBloomMapOpt
           }
 
+          val leftTable = if (usingBootstrappedLeft) {
+            joinConfCloned.metaData.bootstrapTable
+          } else {
+            joinConfCloned.left.table
+          }
+          val leftPartitionSpec = if (usingBootstrappedLeft) {
+            tableUtils.partitionSpec
+          } else {
+            joinConfCloned.left.query.partitionSpec(tableUtils.partitionSpec)
+          }
+
           val runContext =
-            JoinPartJobContext(unfilledLeftDf, bloomFilterOpt, tableProps, runSmallMode)
+            JoinPartJobContext(unfilledLeftDf,
+                               bloomFilterOpt,
+                               tableProps,
+                               runSmallMode,
+                               leftTable = Some(leftTable),
+                               leftPartitionSpec = Some(leftPartitionSpec))
 
           val skewKeys: Option[Map[String, Seq[String]]] = Option(joinConfCloned.skewKeys).map { jmap =>
             val scalaMap = jmap.toScala
             scalaMap.map { case (key, list) =>
               key -> list.asScala.toSeq
             }
-          }
-
-          val leftTable = if (usingBootstrappedLeft) {
-            joinConfCloned.metaData.bootstrapTable
-          } else {
-            JoinUtils.computeFullLeftSourceTableName(joinConfCloned)
           }
 
           val joinPartJobRange = new DateRange()

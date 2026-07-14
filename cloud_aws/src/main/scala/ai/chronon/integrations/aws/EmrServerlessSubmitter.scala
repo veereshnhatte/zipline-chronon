@@ -36,6 +36,7 @@ class EmrServerlessSubmitter(
     flinkEksNamespace: Option[String] = None,
     eksClusterName: Option[String] = None,
     ingressBaseUrl: Option[String] = None,
+    flinkUiProxyEnabled: Boolean = false,
     emrStudioId: Option[String] = None,
     flinkHealthCheckFn: Option[String] => Boolean = _ => true,
     flinkInternalJobIdFetchFn: Option[String] => Option[String] = _ => None,
@@ -315,8 +316,8 @@ class EmrServerlessSubmitter(
         .getOrElse(throw new RuntimeException("K8sFlinkSubmitter is required for Flink jobs"))
         .statusWithCreationTime(deploymentName = parts(2), namespace = parts(1))
       eksStatus match {
-        case JobStatusType.RUNNING if flinkHealthCheckFn(getFlinkUrl(jobId)) => JobStatusType.RUNNING
-        case JobStatusType.RUNNING                                           =>
+        case JobStatusType.RUNNING if flinkHealthCheckFn(Some(jobId)) => JobStatusType.RUNNING
+        case JobStatusType.RUNNING                                    =>
           // Health check failed: job is STABLE on K8s but checkpoints haven't accumulated yet.
           // Within the grace period this is expected (K8s startup consumes part of the window),
           // so stay PENDING rather than triggering a retrigger.
@@ -434,12 +435,13 @@ class EmrServerlessSubmitter(
     if (!jobId.startsWith("flink:")) return None
     val parts = jobId.split(":", 3)
     if (parts.length != 3) return None
+    val namespace = parts(1)
     val deploymentName = parts(2)
-    ingressBaseUrl.map(base => s"${base.stripSuffix("/")}/flink/$deploymentName/")
+    ingressBaseUrl.map(base => K8sFlinkSubmitter.flinkUiUrl(base, namespace, deploymentName, flinkUiProxyEnabled))
   }
 
   override def getFlinkInternalJobId(jobId: String): Option[String] =
-    flinkInternalJobIdFetchFn(getFlinkUrl(jobId))
+    flinkInternalJobIdFetchFn(Some(jobId))
 
   override def getLatestCheckpointPath(flinkInternalJobId: String, flinkStateUri: String): Option[String] = {
     val s3 = s3Client.getOrElse {
@@ -607,6 +609,7 @@ object EmrServerlessSubmitter {
       flinkEksNamespace: Option[String] = None,
       eksClusterName: Option[String] = None,
       ingressBaseUrl: Option[String] = None,
+      flinkUiProxyEnabled: Boolean = K8sFlinkSubmitter.flinkUiProxyEnabledFromEnv(),
       emrStudioId: Option[String] = None,
       cloudWatchLogGroupName: Option[String] = None,
       k8sConfig: Option[io.fabric8.kubernetes.client.Config] = None,
@@ -625,13 +628,15 @@ object EmrServerlessSubmitter {
       client,
       executionRoleArn,
       s3LogUri,
-      eksFlinkSubmitter = Some(EksFlinkSubmitter(k8sConfig, ingressBaseUrl = ingressBaseUrl)),
+      eksFlinkSubmitter = Some(
+        EksFlinkSubmitter(k8sConfig, ingressBaseUrl = ingressBaseUrl, flinkUiProxyEnabled = Some(flinkUiProxyEnabled))),
       awsRegion = awsRegion,
       dqMetricsDataset = dqMetricsDataset,
       flinkEksServiceAccount = flinkEksServiceAccount,
       flinkEksNamespace = flinkEksNamespace,
       eksClusterName = eksClusterName,
       ingressBaseUrl = ingressBaseUrl,
+      flinkUiProxyEnabled = flinkUiProxyEnabled,
       emrStudioId = emrStudioId,
       flinkHealthCheckFn = flinkHealthCheckFn,
       flinkInternalJobIdFetchFn = flinkInternalJobIdFetchFn,
@@ -759,6 +764,7 @@ object EmrServerlessSubmitter {
       flinkEksNamespace = sys.env.get("FLINK_EKS_NAMESPACE"),
       eksClusterName = sys.env.get("EKS_CLUSTER_NAME"),
       ingressBaseUrl = sys.env.get("HUB_BASE_URL"),
+      flinkUiProxyEnabled = K8sFlinkSubmitter.flinkUiProxyEnabledFromEnv(),
       emrStudioId = sys.env.get("EMR_STUDIO_ID"),
       cloudWatchLogGroupName = sys.env.get("EMR_CLOUDWATCH_LOG_GROUP"),
       flinkHealthCheckFn = uri => Await.result(flinkStatusProvider.isFlinkJobHealthy(uri), 30.seconds),

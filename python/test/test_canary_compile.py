@@ -252,6 +252,24 @@ def test_canary_team_without_canary_fields_inherits_default(canary):
     assert env_common.get("VERSION") == "latest"
 
 
+def test_canary_cloud_team_metadata_uses_version_env(canary, monkeypatch):
+    version = "ci-test-version"
+    monkeypatch.setenv("VERSION", version)
+
+    _compile_canary(canary)
+
+    team_metadata_paths = [
+        "compiled/teams_metadata/gcp/gcp_team_metadata",
+        "compiled/teams_metadata/aws/aws_team_metadata",
+        "compiled/teams_metadata/azure/azure_team_metadata",
+        "compiled/teams_metadata/aws_databricks/aws_databricks_team_metadata",
+    ]
+    for relpath in team_metadata_paths:
+        with open(os.path.join(canary, relpath)) as f:
+            env = json.load(f)["executionInfo"]["env"]["common"]
+        assert env["VERSION"] == version
+
+
 def test_no_leak_prod_fields_into_compiled_canary(canary):
     """Strict isolation: nothing under compiled_canary/ should contain any
     prod-only sentinel value from `gcp` Team in `teams.py`. Proves the canary

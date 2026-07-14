@@ -1,3 +1,4 @@
+import datetime
 import functools
 import json
 import logging
@@ -10,6 +11,7 @@ from typing import Optional
 import click
 import requests
 
+from ai.chronon import windows as window_utils
 from ai.chronon.cli import options as cli_options
 from ai.chronon.cli.formatter import (
     Format,
@@ -33,6 +35,7 @@ from ai.chronon.repo.constants import VALID_CLOUDS, RunMode
 from ai.chronon.repo.utils import print_possible_confs, upload_to_blob_store
 from ai.chronon.repo.zipline_hub import ZiplineHub
 from gen_thrift.api.ttypes import DataKind, Environment
+from gen_thrift.common import ttypes as common
 from gen_thrift.planner.ttypes import Mode
 
 logger = logging.getLogger(__name__)
@@ -53,11 +56,9 @@ def _env_string_to_enum(env_str: str) -> int:
     return env_map.get(env_str.lower(), Environment.PROD)
 
 
-def _validate_at_most_daily_schedule(schedule_expression: str) -> Optional[str]:
-    """Validates that a schedule expression runs at most once per day.
+def _validate_supported_schedule(schedule_expression: str) -> Optional[str]:
+    """Validates that a schedule expression is either at most daily or regular sub-daily.
     Returns None if valid, error message string if invalid."""
-    import datetime
-
     from croniter import croniter
 
     if not schedule_expression or schedule_expression.strip().lower() in ("", "none", "null", "@daily", "@never"):
@@ -65,37 +66,151 @@ def _validate_at_most_daily_schedule(schedule_expression: str) -> Optional[str]:
 
     schedule_expression = schedule_expression.strip()
 
+    if schedule_expression.startswith("@"):
+        return "Only @daily and @never aliases are supported; use a 5-field cron expression otherwise."
+
     try:
         croniter(schedule_expression, datetime.datetime(2024, 1, 1, 0, 0))
     except (ValueError, TypeError) as e:
         return f"Invalid cron expression syntax: {e}"
 
     try:
-        test_start = datetime.datetime(2024, 1, 1, 0, 0)
-        for day_offset in range(7):
-            day_start = test_start + datetime.timedelta(days=day_offset)
-            day_end = day_start + datetime.timedelta(days=1)
-            cron_start = day_start - datetime.timedelta(seconds=1)
-            cron = croniter(schedule_expression, cron_start)
-            executions_in_day = 0
-            for _ in range(200):
-                next_run = cron.get_next(datetime.datetime)
-                if next_run >= day_end:
-                    break
-                executions_in_day += 1
-                if executions_in_day > 1:
-                    return (
-                        f"Schedule runs {executions_in_day} times on "
-                        f"{day_start.strftime('%A')} ({day_start.strftime('%Y-%m-%d')}). "
-                        f"Only at-most-daily schedules are allowed."
-                    )
+        window_utils.regular_subdaily_schedule(schedule_expression)
     except Exception as e:
         return f"Error validating schedule frequency: {e}"
 
     return None
 
 
-ALLOWED_DATE_FORMATS = ["%Y-%m-%d"]
+def _validate_at_most_daily_schedule(schedule_expression: str) -> Optional[str]:
+    return _validate_supported_schedule(schedule_expression)
+
+
+_PARTITION_DS_FORMATS = (
+    ("%Y-%m-%d", "%Y-%m-%d"),
+    ("%Y/%m/%d", "%Y-%m-%d"),
+    ("%Y-%m-%d-%H", "%Y-%m-%d-%H-00"),
+    ("%Y-%m-%d-%H-%M", "%Y-%m-%d-%H-%M"),
+    ("%Y-%m-%d-%H:%M", "%Y-%m-%d-%H-%M"),
+    ("%Y-%m-%d %H", "%Y-%m-%d-%H-00"),
+    ("%Y-%m-%d %H:%M", "%Y-%m-%d-%H-%M"),
+    ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d-%H-%M"),
+    ("%Y/%m/%d %H", "%Y-%m-%d-%H-00"),
+    ("%Y/%m/%d %H:%M", "%Y-%m-%d-%H-%M"),
+    ("%Y/%m/%d %H:%M:%S", "%Y-%m-%d-%H-%M"),
+    ("%Y-%m-%dT%H", "%Y-%m-%d-%H-00"),
+    ("%Y-%m-%dT%H:%M", "%Y-%m-%d-%H-%M"),
+    ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d-%H-%M"),
+)
+_PARTITION_DS_FORMAT_HELP = "YYYY-MM-DD, YYYY-MM-DD-HH, YYYY-MM-DD-HH-mm, ISO, or space-separated datetime"
+_EPOCH = datetime.datetime(1970, 1, 1)
+
+
+def _validate_partition_ds_precision(parsed, value):
+    if parsed.second != 0 or parsed.microsecond != 0:
+        raise ValueError(f"'{value}' must be aligned to minute precision")
+
+
+def _parse_partition_ds(value):
+    if isinstance(value, datetime.datetime):
+        _validate_partition_ds_precision(value, value)
+        return value
+    if isinstance(value, date):
+        return datetime.datetime.combine(value, datetime.time.min)
+
+    raw = str(value).strip()
+    for date_format, _ in _PARTITION_DS_FORMATS:
+        try:
+            parsed = datetime.datetime.strptime(raw, date_format)
+        except ValueError:
+            continue
+        _validate_partition_ds_precision(parsed, value)
+        return parsed
+    raise ValueError(f"'{value}' does not match any supported date format: {_PARTITION_DS_FORMAT_HELP}")
+
+
+def _format_partition_ds(value):
+    raw = str(value).strip()
+    for date_format, output_format in _PARTITION_DS_FORMATS:
+        try:
+            parsed = datetime.datetime.strptime(raw, date_format)
+        except ValueError:
+            continue
+        _validate_partition_ds_precision(parsed, value)
+        return parsed.strftime(output_format)
+    if isinstance(value, (datetime.datetime, date)):
+        parsed = _parse_partition_ds(value)
+        return parsed.strftime("%Y-%m-%d-%H-%M" if parsed.time() != datetime.time.min else "%Y-%m-%d")
+    raise ValueError(f"'{value}' does not match any supported date format: {_PARTITION_DS_FORMAT_HELP}")
+
+
+def _is_day_partition_value(value):
+    if isinstance(value, datetime.datetime):
+        return value.time() == datetime.time.min
+    if isinstance(value, date):
+        return True
+    raw = str(value).strip()
+    try:
+        return datetime.datetime.strptime(raw, "%Y-%m-%d").strftime("%Y-%m-%d") == raw
+    except ValueError:
+        return False
+
+
+def _window_json_to_millis(window, default=0):
+    if not window:
+        return default
+    try:
+        thrift_window = common.Window(
+            length=int(window["length"]),
+            timeUnit=int(window["timeUnit"]),
+        )
+    except (KeyError, TypeError, ValueError) as e:
+        raise ValueError(f"Invalid partition window metadata: {window}") from e
+    return window_utils.window_millis(thrift_window)
+
+
+def _snap_date_to_grid(value, interval_millis, offset_millis):
+    if (
+        value is None
+        or interval_millis is None
+        or (interval_millis == window_utils.DAY_MILLIS and offset_millis == 0)
+        or not _is_day_partition_value(value)
+    ):
+        return value
+    millis = int((_parse_partition_ds(value) - _EPOCH).total_seconds() * 1000)
+    snapped = (
+        ((millis - offset_millis) // interval_millis) * interval_millis
+        + offset_millis
+    )
+    return _format_partition_ds(_EPOCH + datetime.timedelta(milliseconds=snapped))
+
+
+def _normalize_submission_partitions(repo, conf, start_ds, end_ds):
+    output_info = (
+        get_metadata_map(os.path.join(repo, conf))
+        .get("executionInfo", {})
+        .get("outputTableInfo", {})
+        or {}
+    )
+    interval_millis = _window_json_to_millis(output_info.get("partitionInterval"), default=None)
+    offset_millis = _window_json_to_millis(output_info.get("partitionOffset"))
+    return (
+        _snap_date_to_grid(start_ds, interval_millis, offset_millis),
+        _snap_date_to_grid(end_ds, interval_millis, offset_millis),
+    )
+
+
+class PartitionDsParamType(click.ParamType):
+    name = "partition"
+
+    def convert(self, value, param, ctx):
+        try:
+            return _format_partition_ds(value)
+        except ValueError as e:
+            self.fail(str(e), param, ctx)
+
+
+PARTITION_DS = PartitionDsParamType()
 
 
 def _resolve_data_type_kinds(obj):
@@ -231,8 +346,8 @@ def ds_option(func):
         "--date",
         "--ds",
         "ds",
-        help="End date for the backfill (format: YYYY-MM-DD).",
-        type=click.DateTime(formats=ALLOWED_DATE_FORMATS),
+        help=f"End date for the backfill (format: {_PARTITION_DS_FORMAT_HELP}).",
+        type=PARTITION_DS,
     )(func)
 
 
@@ -241,8 +356,8 @@ def start_ds_option(func):
         "--start-date",
         "--start-ds",
         "start_ds",
-        type=click.DateTime(formats=ALLOWED_DATE_FORMATS),
-        help="Start date override for a range backfill (format: YYYY-MM-DD). "
+        type=PARTITION_DS,
+        help=f"Start date override for a range backfill (format: {_PARTITION_DS_FORMAT_HELP}). "
         "Supports staging query, group by, and join jobs. "
         "May leave holes in the output table due to the overridden date range.",
     )(func)
@@ -256,11 +371,11 @@ def validate_end_ds_after_start_ds(start_ds, end_ds):
     """
     if start_ds is None or end_ds is None:
         return
-    start_value = start_ds.date() if hasattr(start_ds, "date") else start_ds
-    end_value = end_ds.date() if hasattr(end_ds, "date") else end_ds
+    start_value = _parse_partition_ds(start_ds)
+    end_value = _parse_partition_ds(end_ds)
     if end_value < start_value:
         raise click.BadParameter(
-            f"End date {end_value} is before start date {start_value}. "
+            f"End date {end_ds} is before start date {start_ds}. "
             "End date must be greater than or equal to start date."
         )
 
@@ -276,7 +391,7 @@ def confirm_end_ds_not_future(end_ds, assume_yes: bool = False):
     """
     if end_ds is None or assume_yes:
         return
-    end_date_value = end_ds.date() if hasattr(end_ds, "date") else end_ds
+    end_date_value = _parse_partition_ds(end_ds).date()
     today = date.today()
     if end_date_value >= today:
         click.confirm(
@@ -298,8 +413,8 @@ def end_ds_option(func):
         "--end-date",
         "--end-ds",
         "end_ds",
-        help="End date for a range backfill (format: YYYY-MM-DD).",
-        type=click.DateTime(formats=ALLOWED_DATE_FORMATS),
+        help=f"End date for a range backfill (format: {_PARTITION_DS_FORMAT_HELP}).",
+        type=PARTITION_DS,
         default=str(date.today() - timedelta(days=2)),
         show_default=True,
     )
@@ -451,8 +566,9 @@ def submit_schedule_all(
             format=format,
         )
 
-    # Collect confs with schedules (from ALL confs, not just changed ones)
+    # Collect schedule requests (from ALL confs, not just changed ones)
     confs_with_schedules = []
+    unscheduled_confs = []
     skipped_confs = []
     env_filtered_confs = []
 
@@ -475,13 +591,15 @@ def submit_schedule_all(
 
             schedule_modes = get_schedule_modes(conf.localPath)
 
-            # Skip confs without any schedules
+            # Confs with no schedules are still sent (with "None" modes): the hub retires any
+            # existing schedule rows (removes them; pauses on older hubs) and supersedes old
+            # versions, so unscheduling a conf — or bumping its version and unscheduling in one
+            # change — takes effect. Skipping them here would leave the schedule firing forever.
             if (
                 SCHEDULE_NONE_STR == schedule_modes.offline_schedule
-                and SCHEDULE_NONE_STR ==  schedule_modes.online_schedule
+                and SCHEDULE_NONE_STR == schedule_modes.online_schedule
             ):
-                skipped_confs.append(name)
-                continue
+                unscheduled_confs.append(name)
 
             modes = {
                 RunMode.BACKFILL.value.upper(): schedule_modes.offline_schedule,
@@ -502,7 +620,7 @@ def submit_schedule_all(
 
     if not confs_with_schedules:
         message_parts = [
-            f"No confs with schedules found among loaded confs for environment '{env}'."
+            f"No confs to schedule among loaded confs for environment '{env}'."
         ]
         if env_filtered_confs:
             message_parts.append(
@@ -510,7 +628,7 @@ def submit_schedule_all(
             )
         if skipped_confs:
             message_parts.append(
-                f"{len(skipped_confs)} loaded conf(s) have no schedules defined."
+                f"{len(skipped_confs)} loaded conf(s) failed schedule extraction."
             )
         print_info(" ".join(message_parts), format=format)
         return
@@ -520,6 +638,28 @@ def submit_schedule_all(
         f"Deploying schedules for {len(confs_with_schedules)} conf(s)...", format=format
     ):
         response_json = zipline_hub.call_schedule_all_api(confs_with_schedules)
+
+    # Full sync: schedule-all is authoritative for this branch. Deploys only ever add or
+    # modify rows, so hub schedules whose conf no longer exists in the local repo (deleted
+    # confs, superseded versions) would keep firing forever — retire them here. Best-effort:
+    # skipped when any deploy failed, and non-fatal against hubs without the list/delete APIs.
+    pruned_confs = []
+    if response_json.get("failureCount", 0) == 0:
+        try:
+            listing = zipline_hub.call_schedule_list_api(branch=branch)
+            hub_rows = listing.get("schedules") or []
+            stale_confs = sorted({
+                row["confName"]
+                for row in hub_rows
+                if row.get("branch") == branch and row.get("confName") not in conf_name_to_obj_dict
+            })
+            for stale in stale_confs:
+                zipline_hub.call_schedule_delete_api(conf_name=stale, branch=branch)
+                pruned_confs.append(stale)
+            if pruned_confs:
+                response_json = {**response_json, "prunedSchedules": pruned_confs}
+        except Exception as e:
+            logger.warning(f"Failed to prune stale schedules for branch {branch}: {e}")
 
     # Format output
     if format == Format.JSON:
@@ -577,9 +717,22 @@ def submit_schedule_all(
             f"{', '.join(env_filtered_confs[:5])}"
             f"{'...' if len(env_filtered_confs) > 5 else ''}"
         )
+    if unscheduled_confs:
+        info_parts.append(
+            f"{len(unscheduled_confs)} conf(s) have no schedules defined; sent anyway so the "
+            f"hub retires any existing schedules for them: "
+            f"{', '.join(unscheduled_confs[:5])}"
+            f"{'...' if len(unscheduled_confs) > 5 else ''}"
+        )
+    if pruned_confs:
+        info_parts.append(
+            f"{len(pruned_confs)} stale schedule(s) removed (conf no longer in repo): "
+            f"{', '.join(pruned_confs[:5])}"
+            f"{'...' if len(pruned_confs) > 5 else ''}"
+        )
     if skipped_confs:
         info_parts.append(
-            f"{len(skipped_confs)} conf(s) skipped (no schedules defined): "
+            f"{len(skipped_confs)} conf(s) skipped (failed to read schedules): "
             f"{', '.join(skipped_confs[:5])}"
             f"{'...' if len(skipped_confs) > 5 else ''}"
         )
@@ -606,6 +759,7 @@ def submit_workflow(
             root_dir=repo, env=_env_from_conf_path(conf)
         )
     branch = get_current_branch()
+    start_ds, end_ds = _normalize_submission_partitions(repo, conf, start_ds, end_ds)
 
     with status_spinner("Syncing confs with Hub...", format=format):
         hub_uploader.compute_and_upload_diffs(
@@ -917,6 +1071,7 @@ def clear_downstream(conf, repo, hub_url, use_auth, format, start_ds, end_ds, as
     conf_name = utils.get_metadata_name_from_conf(repo, conf)
     branch = get_current_branch()
     user = get_user_email()
+    start_ds, end_ds = _normalize_submission_partitions(repo, conf, start_ds, end_ds)
 
     with status_spinner("Computing downstream node ranges...", format=format):
         preview_json = zipline_hub.preview_clear_downstream(
@@ -927,12 +1082,11 @@ def clear_downstream(conf, repo, hub_url, use_auth, format, start_ds, end_ds, as
             end=end_ds,
         )
 
-    results = preview_json.get("results", [])
     affected_confs = preview_json.get("affectedConfs", [])
 
     print_key_value("Conf", conf_name, format=format)
-    start_str = start_ds.strftime("%Y-%m-%d") if hasattr(start_ds, "strftime") else str(start_ds)
-    end_str = end_ds.strftime("%Y-%m-%d") if hasattr(end_ds, "strftime") else str(end_ds)
+    start_str = str(start_ds)
+    end_str = str(end_ds)
     print_key_value("Range", f"{start_str} to {end_str}", format=format)
     print_key_value("Affected confs", len(affected_confs), format=format)
     click.echo()
@@ -952,11 +1106,16 @@ def clear_downstream(conf, repo, hub_url, use_auth, format, start_ds, end_ds, as
             sys.exit(0)
 
     with status_spinner("Clearing downstream nodes...", format=format):
-        zipline_hub.apply_clear_downstream(
-            node_results=results,
+        apply_json = zipline_hub.apply_clear_downstream(
+            conf_name=conf_name,
+            branch=branch,
             user=user,
-            affected_confs=affected_confs,
+            start=start_ds,
+            end=end_ds,
         )
+
+    # Apply recomputes the downstream set; use its result for the recompute hints.
+    affected_confs = apply_json.get("affectedConfs", affected_confs)
 
     print_success(f"Cleared {len(affected_confs)} confs", format=format)
     click.echo()
@@ -1458,12 +1617,12 @@ def get_schedule_modes(conf_path: str):
 
     # Validate schedule expressions using croniter-based validation
     if offline_schedule:
-        validation_error = _validate_at_most_daily_schedule(offline_schedule)
+        validation_error = _validate_supported_schedule(offline_schedule)
         if validation_error:
             raise ValueError(f"Invalid offline_schedule: {validation_error}")
 
     if online_schedule:
-        validation_error = _validate_at_most_daily_schedule(online_schedule)
+        validation_error = _validate_supported_schedule(online_schedule)
         if validation_error:
             raise ValueError(f"Invalid online_schedule: {validation_error}")
 

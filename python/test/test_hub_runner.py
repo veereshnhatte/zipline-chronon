@@ -11,6 +11,9 @@
 #     WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #     See the License for the specific language governing permissions and
 #     limitations under the License.
+import datetime
+import json
+import os
 from unittest.mock import Mock, patch
 
 import click
@@ -20,6 +23,7 @@ from rich.text import Text
 
 from ai.chronon.cli.formatter import Format
 from ai.chronon.repo.hub_runner import get_conf_type, hub, redeploy_streaming, repo_option
+from ai.chronon.repo.zipline_hub import _format_hub_partition
 from gen_thrift.api.ttypes import Environment
 
 
@@ -78,6 +82,21 @@ class TestHubRunner:
             traceback.print_exception(type(result.exception), result.exception, result.exception.__traceback__)
 
         return result
+
+    def _subdaily_conf(self, canary, tmp_path, conf):
+        conf_path = tmp_path / conf
+        conf_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(os.path.join(canary, conf), "r") as f:
+            data = json.load(f)
+        data["metaData"]["executionInfo"]["outputTableInfo"] = {
+            "partitionColumn": "ds",
+            "partitionFormat": "yyyy-MM-dd-HH-mm",
+            "partitionInterval": {"length": 3, "timeUnit": 0},
+            "partitionOffset": {"length": 1, "timeUnit": 0},
+        }
+        with open(conf_path, "w") as f:
+            json.dump(data, f)
+        return str(tmp_path), conf
 
     def test_hub_runner(self):
         """Test that hub command group can be invoked."""
@@ -224,6 +243,127 @@ class TestHubRunner:
         ])
 
         assert result.exit_code == 0
+
+    @patch('requests.post')
+    @patch('ai.chronon.repo.hub_runner.get_current_branch')
+    def test_backfill_accepts_subdaily_date_formats(
+        self,
+        mock_get_current_branch,
+        mock_post,
+        canary,
+        online_join_conf,
+    ):
+        """Subdaily Hub backfills should validate common date spellings and send Chronon partitions."""
+        mock_get_current_branch.return_value = "test-branch"
+
+        runner = CliRunner()
+        result = self._run_and_print(runner, hub, [
+            'backfill',
+            online_join_conf,
+            '--chronon-root', canary,
+            '--no-use-auth',
+            '--start-ds', '2024-01-15 03:30',
+            '--end-ds', '2024-01-15T06:30',
+            '--skip-compile',
+        ])
+
+        assert result.exit_code == 0
+        json_payload = mock_post.call_args[1]['json']
+        assert json_payload['start'] == "2024-01-15-03-30"
+        assert json_payload['end'] == "2024-01-15-06-30"
+
+    @patch('requests.post')
+    @patch('ai.chronon.repo.hub_runner.get_current_branch')
+    def test_backfill_accepts_slash_and_zero_second_date_formats(
+        self,
+        mock_get_current_branch,
+        mock_post,
+        canary,
+        online_join_conf,
+    ):
+        mock_get_current_branch.return_value = "test-branch"
+
+        runner = CliRunner()
+        result = self._run_and_print(runner, hub, [
+            'backfill',
+            online_join_conf,
+            '--chronon-root', canary,
+            '--no-use-auth',
+            '--start-ds', '2024/01/15 03:30:00',
+            '--end-ds', '2024-01-15-06:30',
+            '--skip-compile',
+        ])
+
+        assert result.exit_code == 0
+        json_payload = mock_post.call_args[1]['json']
+        assert json_payload['start'] == "2024-01-15-03-30"
+        assert json_payload['end'] == "2024-01-15-06-30"
+
+    @patch('requests.post')
+    @patch('ai.chronon.repo.hub_runner.get_current_branch')
+    def test_backfill_maps_date_only_input_to_containing_subdaily_partition(
+        self,
+        mock_get_current_branch,
+        mock_post,
+        canary,
+        online_join_conf,
+        tmp_path,
+    ):
+        mock_get_current_branch.return_value = "test-branch"
+        chronon_root, conf = self._subdaily_conf(canary, tmp_path, online_join_conf)
+
+        runner = CliRunner()
+        result = self._run_and_print(runner, hub, [
+            'backfill',
+            conf,
+            '--chronon-root', chronon_root,
+            '--no-use-auth',
+            '--start-ds', '2024-01-15',
+            '--end-ds', '2024-01-15',
+            '--skip-compile',
+        ])
+
+        assert result.exit_code == 0
+        json_payload = mock_post.call_args[1]['json']
+        assert json_payload['start'] == "2024-01-14-22-00"
+        assert json_payload['end'] == "2024-01-14-22-00"
+
+    def test_backfill_rejects_invalid_date_formats(self, canary, online_join_conf):
+        runner = CliRunner()
+        result = runner.invoke(hub, [
+            'backfill',
+            online_join_conf,
+            '--chronon-root', canary,
+            '--no-use-auth',
+            '--start-ds', '2024-99-15',
+            '--end-ds', '2024-01-15',
+            '--skip-compile',
+        ])
+
+        assert result.exit_code != 0
+        assert "does not match any supported date format" in result.output
+
+    def test_backfill_rejects_second_precision_date_formats(self, canary, online_join_conf):
+        runner = CliRunner()
+        result = runner.invoke(hub, [
+            'backfill',
+            online_join_conf,
+            '--chronon-root', canary,
+            '--no-use-auth',
+            '--start-ds', '2024-01-15 03:30:01',
+            '--end-ds', '2024-01-15',
+            '--skip-compile',
+        ])
+
+        assert result.exit_code != 0
+        assert "must be aligned to minute precision" in result.output
+
+    def test_zipline_hub_partition_format_preserves_subdaily_datetimes(self):
+        assert _format_hub_partition(datetime.date(2024, 1, 15), None) == "2024-01-15"
+        assert _format_hub_partition(datetime.datetime(2024, 1, 15, 0, 0), None) == "2024-01-15"
+        assert _format_hub_partition(datetime.datetime(2024, 1, 15, 3, 30), None) == "2024-01-15-03-30"
+        with pytest.raises(ValueError, match="minute precision"):
+            _format_hub_partition(datetime.datetime(2024, 1, 15, 3, 30, 1), None)
 
     @patch('requests.post')
     @patch('ai.chronon.repo.hub_runner.get_current_branch')
@@ -625,21 +765,26 @@ class TestHubRunner:
         mock_submit_schedule_all.assert_not_called()
 
 
+    @patch('ai.chronon.repo.hub_runner.get_metadata_map')
     @patch('ai.chronon.repo.hub_runner.get_schedule_modes')
     @patch('ai.chronon.repo.hub_runner.hub_uploader.compute_and_upload_diffs')
     @patch('ai.chronon.repo.hub_runner.hub_uploader.build_local_repo_hashmap')
     @patch('ai.chronon.repo.hub_runner.get_current_branch')
     @patch('ai.chronon.repo.hub_runner.ZiplineHub')
-    def test_schedule_all_skips_confs_with_none_str_schedules(
+    def test_schedule_all_includes_unscheduled_confs_for_retirement(
         self,
         mock_zipline_hub,
         mock_get_current_branch,
         mock_build_hashmap,
         mock_compute_diffs,
         mock_get_schedule_modes,
+        mock_get_metadata_map,
         canary,
     ):
-        """Test that submit_schedule_all skips confs where both schedules are SCHEDULE_NONE_STR."""
+        """Confs whose schedules are all "None" must still be sent to the hub:
+        the "None" modes pause any existing schedule rows and let the hub retire
+        superseded versions, so unscheduling a conf — or bumping its version and
+        unscheduling in one change — actually stops the old nightly runs."""
         from ai.chronon.repo.hub_runner import (
             SCHEDULE_NONE_STR,
             ScheduleModes,
@@ -649,29 +794,40 @@ class TestHubRunner:
 
         mock_get_current_branch.return_value = "test-branch"
 
-        # Mock build_local_repo_hashmap to return a conf without schedules
         conf_without_schedules = Conf(
-            name="test_team.join_without_schedules",
+            name="test_team.join_without_schedules__2",
             localPath="/path/to/conf",
             hash="hash1",
         )
         mock_build_hashmap.return_value = {
-            "test_team.join_without_schedules": conf_without_schedules,
+            "test_team.join_without_schedules__2": conf_without_schedules,
         }
 
         # Mock compute_and_upload_diffs (still called to upload any changes)
         mock_compute_diffs.return_value = {}
 
-        # Mock get_schedule_modes to return SCHEDULE_NONE_STR for both schedules
+        # No environments field -> defaults to prod
+        mock_get_metadata_map.return_value = {"executionInfo": {}}
         mock_get_schedule_modes.return_value = ScheduleModes(
             offline_schedule=SCHEDULE_NONE_STR,
             online_schedule=SCHEDULE_NONE_STR
         )
 
-        # Mock ZiplineHub instance
         mock_hub_instance = mock_zipline_hub.return_value
+        mock_hub_instance.call_schedule_all_api.return_value = {
+            "totalCount": 1,
+            "successCount": 1,
+            "failureCount": 0,
+            "results": [
+                {
+                    "confName": "test_team.join_without_schedules__2",
+                    "success": True,
+                    "schedules": {},
+                }
+            ],
+        }
+        mock_hub_instance.call_schedule_list_api.return_value = {"schedules": [], "totalCount": 0}
 
-        # Call submit_schedule_all
         submit_schedule_all(
             repo=canary,
             cloud='gcp',
@@ -680,8 +836,225 @@ class TestHubRunner:
             use_auth=False
         )
 
-        # Verify call_schedule_all_api was NOT called since all confs have no schedules
-        mock_hub_instance.call_schedule_all_api.assert_not_called()
+        mock_hub_instance.call_schedule_all_api.assert_called_once()
+        submitted = mock_hub_instance.call_schedule_all_api.call_args[0][0]
+        assert submitted == [
+            {
+                "conf_name": "test_team.join_without_schedules__2",
+                "conf_hash": "hash1",
+                "branch": "test-branch",
+                "modes": {
+                    "BACKFILL": SCHEDULE_NONE_STR,
+                    "DEPLOY": SCHEDULE_NONE_STR,
+                },
+            }
+        ]
+        # locally-present confs are never pruned, scheduled or not
+        mock_hub_instance.call_schedule_delete_api.assert_not_called()
+
+    @patch('ai.chronon.repo.hub_runner.get_metadata_map')
+    @patch('ai.chronon.repo.hub_runner.get_schedule_modes')
+    @patch('ai.chronon.repo.hub_runner.hub_uploader.compute_and_upload_diffs')
+    @patch('ai.chronon.repo.hub_runner.hub_uploader.build_local_repo_hashmap')
+    @patch('ai.chronon.repo.hub_runner.get_current_branch')
+    @patch('ai.chronon.repo.hub_runner.ZiplineHub')
+    def test_schedule_all_sends_partial_schedules_with_none_mode(
+        self,
+        mock_zipline_hub,
+        mock_get_current_branch,
+        mock_build_hashmap,
+        mock_compute_diffs,
+        mock_get_schedule_modes,
+        mock_get_metadata_map,
+        canary,
+    ):
+        """A conf with only one mode scheduled (offline cron, online "None") is
+        submitted with both modes verbatim — the hub deploys the cron mode and
+        pauses the "None" mode. Such confs are not treated as unscheduled."""
+        from ai.chronon.repo.hub_runner import (
+            SCHEDULE_NONE_STR,
+            ScheduleModes,
+            submit_schedule_all,
+        )
+        from gen_thrift.api.ttypes import Conf
+
+        mock_get_current_branch.return_value = "test-branch"
+        mock_build_hashmap.return_value = {
+            "test_team.offline_only_join": Conf(
+                name="test_team.offline_only_join",
+                localPath="/path/to/conf",
+                hash="hash1",
+            ),
+        }
+        mock_compute_diffs.return_value = {}
+        mock_get_metadata_map.return_value = {"executionInfo": {}}
+        mock_get_schedule_modes.return_value = ScheduleModes(
+            offline_schedule="0 1 * * *",
+            online_schedule=SCHEDULE_NONE_STR,
+        )
+
+        mock_hub_instance = mock_zipline_hub.return_value
+        mock_hub_instance.call_schedule_all_api.return_value = {
+            "totalCount": 1,
+            "successCount": 1,
+            "failureCount": 0,
+            "results": [
+                {
+                    "confName": "test_team.offline_only_join",
+                    "success": True,
+                    "schedules": {},
+                }
+            ],
+        }
+        mock_hub_instance.call_schedule_list_api.return_value = {"schedules": [], "totalCount": 0}
+
+        submit_schedule_all(
+            repo=canary,
+            cloud='gcp',
+            customer_id=None,
+            hub_url=None,
+            use_auth=False
+        )
+
+        submitted = mock_hub_instance.call_schedule_all_api.call_args[0][0]
+        assert submitted == [
+            {
+                "conf_name": "test_team.offline_only_join",
+                "conf_hash": "hash1",
+                "branch": "test-branch",
+                "modes": {
+                    "BACKFILL": "0 1 * * *",
+                    "DEPLOY": SCHEDULE_NONE_STR,
+                },
+            }
+        ]
+
+    @patch('ai.chronon.repo.hub_runner.get_metadata_map')
+    @patch('ai.chronon.repo.hub_runner.get_schedule_modes')
+    @patch('ai.chronon.repo.hub_runner.hub_uploader.compute_and_upload_diffs')
+    @patch('ai.chronon.repo.hub_runner.hub_uploader.build_local_repo_hashmap')
+    @patch('ai.chronon.repo.hub_runner.get_current_branch')
+    @patch('ai.chronon.repo.hub_runner.ZiplineHub')
+    def test_schedule_all_full_sync_prunes_stale_schedules(
+        self,
+        mock_zipline_hub,
+        mock_get_current_branch,
+        mock_build_hashmap,
+        mock_compute_diffs,
+        mock_get_schedule_modes,
+        mock_get_metadata_map,
+        canary,
+    ):
+        """schedule-all is a full sync for its branch: hub schedules whose conf
+        is no longer in the local repo (deleted confs, superseded versions) are
+        deleted. Rows deployed from other branches are left alone."""
+        from ai.chronon.repo.hub_runner import ScheduleModes, submit_schedule_all
+        from gen_thrift.api.ttypes import Conf
+
+        mock_get_current_branch.return_value = "test-branch"
+        mock_build_hashmap.return_value = {
+            "test_team.image_swiped__4": Conf(
+                name="test_team.image_swiped__4",
+                localPath="/path/to/conf",
+                hash="hash4",
+            ),
+        }
+        mock_compute_diffs.return_value = {}
+        mock_get_metadata_map.return_value = {"executionInfo": {}}
+        mock_get_schedule_modes.return_value = ScheduleModes(
+            offline_schedule="0 1 * * *",
+            online_schedule="None",
+        )
+
+        mock_hub_instance = mock_zipline_hub.return_value
+        mock_hub_instance.call_schedule_all_api.return_value = {
+            "totalCount": 1,
+            "successCount": 1,
+            "failureCount": 0,
+            "results": [
+                {"confName": "test_team.image_swiped__4", "success": True, "schedules": {}}
+            ],
+        }
+        mock_hub_instance.call_schedule_list_api.return_value = {
+            "schedules": [
+                {"confName": "test_team.image_swiped__4", "branch": "test-branch"},
+                {"confName": "test_team.image_swiped__3", "branch": "test-branch"},
+                {"confName": "test_team.other_join__1", "branch": "other-branch"},
+            ],
+            "totalCount": 3,
+        }
+
+        submit_schedule_all(
+            repo=canary,
+            cloud='gcp',
+            customer_id=None,
+            hub_url=None,
+            use_auth=False
+        )
+
+        mock_hub_instance.call_schedule_list_api.assert_called_once_with(branch="test-branch")
+        # only the same-branch conf that vanished from the repo is deleted
+        mock_hub_instance.call_schedule_delete_api.assert_called_once_with(
+            conf_name="test_team.image_swiped__3", branch="test-branch"
+        )
+
+    @patch('ai.chronon.repo.hub_runner.get_metadata_map')
+    @patch('ai.chronon.repo.hub_runner.get_schedule_modes')
+    @patch('ai.chronon.repo.hub_runner.hub_uploader.compute_and_upload_diffs')
+    @patch('ai.chronon.repo.hub_runner.hub_uploader.build_local_repo_hashmap')
+    @patch('ai.chronon.repo.hub_runner.get_current_branch')
+    @patch('ai.chronon.repo.hub_runner.ZiplineHub')
+    def test_schedule_all_skips_prune_when_deploys_fail(
+        self,
+        mock_zipline_hub,
+        mock_get_current_branch,
+        mock_build_hashmap,
+        mock_compute_diffs,
+        mock_get_schedule_modes,
+        mock_get_metadata_map,
+        canary,
+    ):
+        """A failing deploy batch must not prune: absence-based deletion is only
+        trustworthy when the whole snapshot deployed cleanly."""
+        from ai.chronon.repo.hub_runner import ScheduleModes, submit_schedule_all
+        from gen_thrift.api.ttypes import Conf
+
+        mock_get_current_branch.return_value = "test-branch"
+        mock_build_hashmap.return_value = {
+            "test_team.image_swiped__4": Conf(
+                name="test_team.image_swiped__4",
+                localPath="/path/to/conf",
+                hash="hash4",
+            ),
+        }
+        mock_compute_diffs.return_value = {}
+        mock_get_metadata_map.return_value = {"executionInfo": {}}
+        mock_get_schedule_modes.return_value = ScheduleModes(
+            offline_schedule="0 1 * * *",
+            online_schedule="None",
+        )
+
+        mock_hub_instance = mock_zipline_hub.return_value
+        mock_hub_instance.call_schedule_all_api.return_value = {
+            "totalCount": 1,
+            "successCount": 0,
+            "failureCount": 1,
+            "results": [
+                {"confName": "test_team.image_swiped__4", "success": False, "error": "boom"}
+            ],
+        }
+
+        with pytest.raises(SystemExit):
+            submit_schedule_all(
+                repo=canary,
+                cloud='gcp',
+                customer_id=None,
+                hub_url=None,
+                use_auth=False
+            )
+
+        mock_hub_instance.call_schedule_list_api.assert_not_called()
+        mock_hub_instance.call_schedule_delete_api.assert_not_called()
 
     @patch('ai.chronon.repo.hub_runner.get_metadata_map')
     @patch('ai.chronon.repo.hub_runner.get_schedule_modes')
@@ -986,6 +1359,9 @@ class TestHubRunner:
             "results": [
                 {"nodeName": "aws.my_node.v1", "startPartition": "2024-01-01", "endPartition": "2024-01-05"},
             ],
+            "affectedConfs": [
+                {"confName": "aws.my_conf.v1", "startPartition": "2024-01-01", "endPartition": "2024-01-05", "mode": "backfill"},
+            ],
             "totalNodesCleared": 1,
             "message": "Cleared 1 nodes",
         }
@@ -1023,10 +1399,13 @@ class TestHubRunner:
         apply_call = mock_post.call_args_list[1]
         assert "/workflow/v2/clear-downstream/apply" in apply_call[0][0]
         apply_payload = apply_call[1]['json']
-        assert len(apply_payload['nodeResults']) == 1
+        # Apply sends the same inputs as preview (the hub recomputes) — no nodeResults round-trip.
+        assert apply_payload['confName'] == ".".join(online_join_conf.split("/")[-2:])
+        assert apply_payload['branch'] == "test-branch"
         assert apply_payload['user'] == "test@example.com"
-        assert len(apply_payload['affectedConfs']) == 1
-        assert apply_payload['affectedConfs'][0]['confName'] == "aws.my_conf.v1"
+        assert apply_payload['start'] == "2024-01-01"
+        assert apply_payload['end'] == "2024-01-05"
+        assert 'nodeResults' not in apply_payload
 
     @patch('ai.chronon.repo.hub_runner.get_metadata_map')
     @patch('ai.chronon.repo.hub_runner.get_schedule_modes')

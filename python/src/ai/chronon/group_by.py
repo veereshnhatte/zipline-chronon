@@ -41,7 +41,9 @@ def _get_output_table_name(obj, full_name: bool = False):
     Group by backfill output table name
     To be synced with api.Extensions.scala
     """
-    return utils._ensure_name_and_get_output_table(obj, ttypes.GroupBy, "group_bys", full_name)
+    return utils._ensure_name_and_get_output_table_reference(
+        obj, ttypes.GroupBy, "group_bys", full_name
+    )
 
 
 #  The GroupBy's default online/production status is None and it will inherit
@@ -250,6 +252,7 @@ def DefaultAggregation(keys, sources, operation=Operation.LAST, tags=None):
 
 
 class TimeUnit:
+    MINUTES = common.TimeUnit.MINUTES
     HOURS = common.TimeUnit.HOURS
     DAYS = common.TimeUnit.DAYS
 
@@ -315,6 +318,7 @@ def Derivation(name: str, expression: str) -> ttypes.Derivation:
         Use ``from ai.chronon.types import Derivation`` instead.
     """
     import warnings
+
     warnings.warn(
         "Importing Derivation from ai.chronon.group_by is deprecated. "
         "Use 'from ai.chronon.types import Derivation' instead.",
@@ -322,6 +326,7 @@ def Derivation(name: str, expression: str) -> ttypes.Derivation:
         stacklevel=2,
     )
     from ai.chronon.derivation import Derivation as _Derivation
+
     return _Derivation(name=name, expression=expression)
 
 
@@ -426,18 +431,26 @@ Keys {unselected_keys}, are unselected in source
                         "example required: {'k': '128', 'percentiles': '[0.4,0.5,0.95]'},"
                         f" received: {agg.argMap}\n"
                     )
-            if agg.windows:
-                assert not (
-                    # Snapshot accuracy.
-                    (group_by.accuracy and group_by.accuracy == Accuracy.SNAPSHOT)
-                    and
-                    # Hourly aggregation.
-                    any([window.timeUnit == TimeUnit.HOURS for window in agg.windows])
-                ), (
-                    "Detected a snapshot accuracy group by with an hourly aggregation. Resolution with snapshot "
-                    "accuracy is not fine enough to allow hourly group bys. Consider adjusting the aggregation window. "
-                    f"input_column: {agg.inputColumn}, windows: {agg.windows}"
+            if agg.windows and group_by.accuracy == Accuracy.SNAPSHOT:
+                # snapshot accuracy resolves windows on the partition grid: every window must
+                # be a multiple of the declared partition interval. A sub-daily grid makes
+                # sub-daily windows legal (e.g. a 6h window on a 3h grid); on the daily
+                # default, sub-daily windows stay rejected as before.
+                meta = group_by.metaData
+                exec_info = meta.executionInfo if meta else None
+                output_info = exec_info.outputTableInfo if exec_info else None
+                grid = output_info.partitionInterval if output_info else None
+                grid_ms = (
+                    window_utils.window_millis(grid) if grid else window_utils.DAY_MILLIS
                 )
+                for window in agg.windows:
+                    assert window_utils.window_millis(window) % grid_ms == 0, (
+                        "Detected a snapshot accuracy group by with a window that is not a "
+                        "multiple of its partition interval; on-boundary snapshots cannot "
+                        "resolve it. Adjust the window or declare a finer partition_interval. "
+                        f"input_column: {agg.inputColumn}, windows: {agg.windows}, "
+                        f"partition interval: {grid_ms}ms"
+                    )
 
 
 def _get_op_suffix(operation, argmap):
@@ -490,6 +503,7 @@ def GroupBy(
     tags: Dict[str, str] = None,
     online: bool = DEFAULT_ONLINE,
     production: bool = DEFAULT_PRODUCTION,
+    key_filter: Optional[Union[ttypes.Source, ttypes.EntitySource]] = None,
     # execution params
     offline_schedule: str = None,
     online_schedule: Optional[str] = None,
@@ -499,6 +513,9 @@ def GroupBy(
     step_days: int = None,
     disable_historical_backfill: bool = False,
     environments: Optional[List[str]] = None,
+    partition_interval: Optional[Union[common.Window, str]] = None,
+    partition_offset: Optional[Union[common.Window, str]] = None,
+    workflow_concurrency: Optional[int] = None,
 ) -> ttypes.GroupBy:
     """
 
@@ -585,25 +602,32 @@ def GroupBy(
         This is used by airflow integration to pick an older hive partition to wait on.
     :type lag: int
     :param offline_schedule:
-        The offline schedule interval for batch jobs. Supports standard cron expressions
-        that run at most once per day. Examples::
+        The offline schedule interval for batch jobs. Supports standard cron expressions,
+        including regular sub-daily schedules. Examples::
 
             '@daily': Legacy format for midnight daily execution
             '0 2 * * *': Daily at 2:00 AM
-            '30 14 * * MON-FRI': Weekdays at 2:30 PM
-            '0 9 * * 1': Mondays at 9:00 AM
-            '15 23 * * SUN': Sundays at 11:15 PM
+            '0 */3 * * *': Every 3 hours
+            '5/15 * * * *': Every 15 minutes with a 5 minute processing offset
             '@never': Explicitly disable offline scheduling
-
-        Note: Hourly, sub-hourly, or multi-daily schedules are not supported.
 
     :type offline_schedule: str
     :param online_schedule:
         The online schedule interval for real-time serving jobs. Supports standard cron expressions
-        that run at most once per day. When online=True and online_schedule is not specified,
-        defaults to "@daily". Set to "@never" to explicitly disable online scheduling even when online=True.
+        When online=True and online_schedule is not specified, defaults to offline_schedule when present,
+        otherwise "@daily". Set to "@never" to explicitly disable online scheduling even when online=True.
         Examples follow the same format as offline_schedule.
     :type online_schedule: Optional[str]
+    :param partition_interval:
+        Output partition interval for this GroupBy. Examples: "1d", "3h", "15m".
+        When set below daily, Chronon uses "yyyy-MM-dd-HH-mm" ds values.
+    :type partition_interval: Optional[Union[common.Window, str]]
+    :param partition_offset:
+        Offset from UTC midnight/epoch for the output partition grid. Defaults to zero
+        (boundaries at midnight) and must be declared explicitly to move the grid; the cron
+        fire phase is treated as a processing delay relative to the declared grid, never as
+        a grid offset.
+    :type partition_offset: Optional[Union[common.Window, str]]
     :param tags:
         Additional metadata that does not directly affect feature computation, but is useful to
         track for management purposes.
@@ -636,10 +660,23 @@ def GroupBy(
         Cluster configuration properties for the join.
     :param step_days
         The maximum number of days to output at once
+    :param key_filter:
+        An entities source whose snapshot partition for the upload date restricts which keys make it
+        into the batch upload: the aggregated upload rows (one per key) are semi-joined against the
+        distinct key tuples found in this source. The filter's query.selects must produce columns named after
+        (a subset of) the GroupBy keys. Only applied by uploads to shrink upload size - backfills ignore
+        it, and it does not affect semantic hashes, so setting or changing it never re-triggers jobs.
+        Note: for TEMPORAL GroupBys with a streaming topic, the streaming job still writes all keys, so
+        filtered-out keys may serve partial streaming-only aggregates instead of nulls.
+    :type key_filter: gen_thrift.api.ttypes.EntitySource (or a Source wrapping one)
     :param environments:
         List of environments where this GroupBy should be deployed/available.
         Defaults to ['prod']. Valid values: 'prod', 'canary' (case-insensitive).
     :type environments: List[str]
+    :param workflow_concurrency:
+        Default maximum number of workflow steps Hub may allocate concurrently
+        when a workflow is started from this GroupBy. Request-level overrides
+        take precedence.
     :return:
         A GroupBy object containing specified aggregations.
     """
@@ -687,9 +724,22 @@ def GroupBy(
         return source
 
     sources = [
-        _sanitize_columns(source)
-        for source in utils.normalize_sources(sources, output_namespace)
+        _sanitize_columns(source) for source in utils.normalize_sources(sources, output_namespace)
     ]
+
+    if key_filter is not None:
+        if isinstance(key_filter, ttypes.Source):
+            assert key_filter.entities is not None, "key_filter must be an entities source"
+            key_filter = key_filter.entities
+        assert isinstance(key_filter, ttypes.EntitySource) and key_filter.snapshotTable, (
+            "key_filter must be an entities source with a snapshotTable"
+        )
+        key_filter_selects = key_filter.query.selects if key_filter.query is not None else None
+        if key_filter_selects is not None:
+            assert any(k in key_filter_selects for k in keys), (
+                f"key_filter selects {sorted(key_filter_selects.keys())} share no columns with "
+                f"the GroupBy keys {keys}. Name the filter's selects after the key columns."
+            )
 
     # get caller's filename to assign team
     team = inspect.stack()[1].filename.split("/")[-2]
@@ -701,12 +751,30 @@ def GroupBy(
             "Either set online=True or remove the online_schedule parameter."
         )
 
+    subdaily_output = window_utils.is_subdaily(partition_interval, offline_schedule)
+
     # "@never" explicitly disables online scheduling even when online=True
     if online_schedule == "@never":
         online_schedule = None
-    # Set default online_schedule if online is True and online_schedule is not specified
+    # Set default online_schedule if online is True and online_schedule is not specified.
+    # Inherit the offline schedule only when it is sub-daily; daily confs keep the
+    # historical "@daily" default so existing semantic hashes don't churn.
     elif online and online_schedule is None:
-        online_schedule = "@daily"
+        if subdaily_output and offline_schedule not in (None, "@never"):
+            online_schedule = offline_schedule
+        else:
+            online_schedule = "@daily"
+    elif (
+        online
+        and subdaily_output
+        and online_schedule is not None
+        and offline_schedule not in (None, "@never")
+        and online_schedule != offline_schedule
+    ):
+        raise ValueError(
+            "online_schedule must match offline_schedule for sub-daily partition_interval when both are set. "
+            "Leave online_schedule empty to inherit the offline schedule."
+        )
 
     exec_info = common.ExecutionInfo(
         offlineSchedule=offline_schedule,
@@ -716,6 +784,12 @@ def GroupBy(
         stepDays=step_days,
         historicalBackfill=disable_historical_backfill,
         clusterConf=cluster_conf,
+        outputTableInfo=window_utils.output_table_info(
+            partition_interval,
+            partition_offset=partition_offset,
+            schedule=offline_schedule,
+        ),
+        workflowConcurrency=workflow_concurrency,
     )
 
     column_tags = {}
@@ -724,6 +798,18 @@ def GroupBy(
             if hasattr(agg, "tags") and agg.tags:
                 for output_col in get_output_col_names(agg):
                     column_tags[output_col] = agg.tags
+
+    output_info = exec_info.outputTableInfo
+    if (
+        output_info is not None
+        and window_utils.PartitionSpec.from_table_info(output_info).requires_grid_aware_path()
+    ):
+        for source in sources:
+            inner = source.events or source.entities or source.joinSource
+            source_table = getattr(inner, "table", None) or getattr(inner, "snapshotTable", None)
+            window_utils.validate_source_grid(
+                "This GroupBy", window_utils.source_query(source), f"source {source_table}"
+            )
 
     metadata = ttypes.MetaData(
         online=online,
@@ -745,6 +831,7 @@ def GroupBy(
         metaData=metadata,
         accuracy=accuracy,
         derivations=derivations,
+        keyFilter=key_filter,
     )
     validate_group_by(group_by)
 
