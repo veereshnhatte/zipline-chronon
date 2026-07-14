@@ -929,34 +929,9 @@ object GroupBy {
     val tableProps = Option(groupByConf.metaData.tableProperties)
       .map(_.toScala)
       .orNull
-    // Only include sources whose partitions are catalog-managed (Hive, Iceberg, external tables, etc.)
-    // using the same column as the output. Sources with a custom partitionColumn (virtual/timestamp-based) have no catalog-tracked
-    // partitions, so including them would make all output partitions appear input-missing
-    // and suppress the backfill entirely.
-    val catalogPartitionedSources = groupByConf.sources.toScala.filter { source =>
-      Option(source.query.partitionColumn).forall(_ == tableUtils.partitionSpec.column)
-    }
-    val sourceTables = catalogPartitionedSources.flatMap { source =>
-      val mutationTable =
-        if (source.isSetEntities && source.getEntities.isSetMutationTable)
-          Seq(source.getEntities.mutationTable.cleanSpec)
-        else
-          Seq.empty
-      Seq(source.table) ++ mutationTable
-    }.distinct
-    // Collect distinct partition specs so unfilledRanges uses each source's own spec
-    // (e.g. hourly vs daily) when checking readiness.
-    val sourcePartitionSpecs = catalogPartitionedSources
-      .map(_.query.partitionSpec(tableUtils.partitionSpec))
-      .distinct
-    val inputTablesOpt = if (sourceTables.nonEmpty) Some(sourceTables) else None
-    val groupByUnfilledRangesOpt = tableUtils.unfilledRanges(
-      outputTable,
-      PartitionRange(startPartition, endPartition)(tableUtils.partitionSpec),
-      inputTablesOpt,
-      skipFirstHole = skipFirstHole,
-      inputPartitionSpecs = if (sourcePartitionSpecs.nonEmpty) sourcePartitionSpecs else Seq(tableUtils.partitionSpec)
-    )
+    val groupByUnfilledRangesOpt = Option(
+      Seq(PartitionRange(startPartition, endPartition)(tableUtils.partitionSpec))
+    ) // TODO(tchow): possilbly revert if orchestrator is not yet available.
 
     if (groupByUnfilledRangesOpt.isEmpty) {
       logger.info(s"""Nothing to backfill for $outputTable - given
