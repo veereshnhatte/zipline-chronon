@@ -217,7 +217,10 @@ class Join(joinConf: api.Join,
     }.toSeq
   }
 
-  override def computeFinalJoin(leftDf: DataFrame, leftRange: PartitionRange, bootstrapInfo: BootstrapInfo): Unit = {
+  override def computeFinalJoin(leftDf: DataFrame,
+                                leftRange: PartitionRange,
+                                bootstrapInfo: BootstrapInfo,
+                                outputLocation: Option[String] = None): Unit = {
     val bootstrapDf =
       tableUtils.scanDf(query = null, table = bootstrapTable, range = Some(leftRange)).addTimebasedColIfExists()
     val rightPartsData = getRightPartsData(leftRange)
@@ -237,7 +240,7 @@ class Join(joinConf: api.Join,
       }
     val df = processJoinedDf(joinedDfTry, leftDf, bootstrapInfo, bootstrapDf)
     JoinUtils.withFinalJoinWriteOptimizations(tableUtils) {
-      df.save(outputTable, tableProps, autoExpand = true)
+      df.save(outputTable, tableProps, autoExpand = true, outputLocation = outputLocation)
     }
   }
 

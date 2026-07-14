@@ -232,9 +232,13 @@ abstract class JoinBase(val joinConfCloned: api.Join,
     }
   }
 
-  def computeFinalJoin(leftDf: DataFrame, leftRange: PartitionRange, bootstrapInfo: BootstrapInfo): Unit
+  def computeFinalJoin(leftDf: DataFrame,
+                       leftRange: PartitionRange,
+                       bootstrapInfo: BootstrapInfo,
+                       outputLocation: Option[String] = None): Unit
 
-  def computeFinal(overrideStartPartition: Option[String] = None): Unit = {
+  def computeFinal(overrideStartPartition: Option[String] = None,
+                   outputLocation: Option[String] = None): Unit = {
 
     // Utilizes the same tablesToRecompute check as the monolithic spark job, because if any joinPart changes, then so does the output table
     if (tablesToRecompute(joinConfCloned, outputTable, tableUtils).isEmpty) {
@@ -256,7 +260,7 @@ abstract class JoinBase(val joinConfCloned: api.Join,
       unfilledRanges.foreach { unfilledRange =>
         val leftDf = JoinUtils.leftDf(joinConfCloned, unfilledRange, tableUtils)
         if (leftDf.isDefined) {
-          computeFinalJoin(leftDf.get, unfilledRange, bootstrapInfo)
+          computeFinalJoin(leftDf.get, unfilledRange, bootstrapInfo, outputLocation = outputLocation)
         } else {
           logger.info(s"Query produced no results for date range: $unfilledRange. Please check upstream.")
         }
