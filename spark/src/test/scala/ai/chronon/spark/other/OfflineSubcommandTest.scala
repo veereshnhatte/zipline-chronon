@@ -53,4 +53,15 @@ class OfflineSubcommandTest extends AnyFlatSpec {
     assertEquals(confPath, args.confPath())
     assertEquals(endData, args.endDate())
   }
+
+  it should "parse output-location when provided" in {
+    val outputLocation = "s3://bucket/warehouse/path"
+    val args = new TestArgs(Seq("--output-location", outputLocation).toArray)
+    assertEquals(Some(outputLocation), args.outputLocation.toOption)
+  }
+
+  it should "leave output-location unset when not provided" in {
+    val args = new TestArgs(Seq("--conf-path", "joins/team/example_join.v1").toArray)
+    assertTrue(args.outputLocation.isEmpty)
+  }
 }
