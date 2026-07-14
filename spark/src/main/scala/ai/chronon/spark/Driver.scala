@@ -17,7 +17,7 @@
 package ai.chronon.spark
 
 import ai.chronon.api
-import ai.chronon.api.{Constants, DateRange, PartitionRange, PartitionSpec, ThriftJsonCodec}
+import ai.chronon.api.{Constants, DateRange, PartitionRange, PartitionSpec, ThriftJsonCodec, TsUtils}
 import ai.chronon.api.Constants.{KvTablePrefixArg, MetadataDataset}
 import ai.chronon.api.Extensions.{GroupByOps, JoinPartOps, MetadataOps, SourceOps}
 import ai.chronon.api.planner.RelevantLeftForJoinPart
@@ -290,7 +290,7 @@ object Driver {
           s"Filling partitions for join:$joinName, partitions:[$startPartition, $endPartition], steps:$stepDays")
 
         val partitionRange = PartitionRange(startPartition, endPartition)(tableUtils.partitionSpec)
-        val partitionSteps = partitionRange.steps(stepDays)
+        val partitionSteps = partitionRange.stepsByDays(stepDays)
 
         partitionSteps.zipWithIndex.foreach { case (stepRange, idx) =>
           logger.info(s"Processing range $stepRange (${idx + 1}/${partitionSteps.length})")
@@ -388,7 +388,7 @@ object Driver {
         args.buildTableUtils(),
         !args.runFirstHole()
       )
-      join.computeFinal(args.startPartition.toOption)
+      join.computeFinal(args.startPartition.toOption, outputLocation = args.outputLocation.toOption)
     }
   }
 
@@ -462,7 +462,7 @@ object Driver {
       new Analyzer(
         tableUtils,
         args.confPath(),
-        args.startDate.getOrElse(tableUtils.partitionSpec.shiftBackFromNow(3)),
+        args.startDate.getOrElse(tableUtils.partitionSpec.at(TsUtils.daysAgoMillis(3))),
         args.endDate(),
         args.skewKeyCount(),
         args.sample(),
@@ -511,7 +511,8 @@ object Driver {
         args.enableAutoExpand.toOption,
         args.startPartition.toOption,
         !args.runFirstHole(),
-        args.forceOverwrite()
+        args.forceOverwrite(),
+        outputLocation = args.outputLocation.toOption
       )
 
       if (args.shouldExport()) {
@@ -536,7 +537,8 @@ object Driver {
       GroupByUpload.run(parseConf[api.GroupBy](args.confPath()),
                         args.endDate(),
                         Some(args.buildTableUtils()),
-                        jsonPercent = args.jsonPercent.apply())
+                        jsonPercent = args.jsonPercent.apply(),
+                        outputLocation = args.outputLocation.toOption)
     }
   }
 
@@ -896,7 +898,7 @@ object Driver {
         .setEndDate(endDate)
 
       // Run the SourceJob
-      val sourceJob = new SourceJob(sourceWithFilterNode, sourceMetaData, dateRange)(tableUtils)
+      val sourceJob = new SourceJob(sourceWithFilterNode, sourceMetaData, dateRange, outputLocation = args.outputLocation.toOption)(tableUtils)
       sourceJob.run()
 
       logger.info(s"SourceJob completed. Output table: ${outputTable}")
@@ -958,7 +960,7 @@ object Driver {
         .setEndDate(endDate)
 
       // Run the JoinPartJob
-      val joinPartJob = new JoinPartJob(joinPartNode, metadata, dateRange, showDf = false)(tableUtils)
+      val joinPartJob = new JoinPartJob(joinPartNode, metadata, dateRange, showDf = false, outputLocation = args.outputLocation.toOption)(tableUtils)
       joinPartJob.run()
 
       logger.info(s"JoinPartJob completed. Output table: ${metadata.outputTable}")
@@ -1002,7 +1004,7 @@ object Driver {
       val mergeNode = new JoinMergeNode()
         .setJoin(joinConf)
 
-      val mergeJob = new MergeJob(mergeNode, mergeMetaData, dateRange, allJoinParts)(tableUtils)
+      val mergeJob = new MergeJob(mergeNode, mergeMetaData, dateRange, allJoinParts, outputLocation = args.outputLocation.toOption)(tableUtils)
 
       mergeJob.run()
 

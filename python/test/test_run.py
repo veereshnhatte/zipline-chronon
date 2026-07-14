@@ -18,6 +18,7 @@ Basic tests for namespace and breaking changes in run.py
 
 import json
 import os
+import shlex
 import tempfile
 import time
 
@@ -385,3 +386,39 @@ def test_validate_additional_jars_strips_whitespace(value, expected):
 def test_validate_additional_jars_rejects_unsupported_schemes(value):
     with pytest.raises(click.BadParameter):
         run.validate_additional_jars(None, None, value)
+
+
+def _backfill_runner_args(repo, **overrides):
+    args = {
+        "repo": repo,
+        "conf": "compiled/group_bys/sample_team/sample_group_by.v1__0",
+        "mode": RunMode.BACKFILL,
+        "ds": "2024-01-01",
+        "sub_help": None,
+        "args": "",
+        "app_name": "test_app",
+        "online_jar": None,
+        "online_class": None,
+        "spark_submit_path": "/bin/false",
+        "list_apps": "echo",
+    }
+    args.update(overrides)
+    return args
+
+
+def test_gen_final_args_includes_quoted_output_location(repo, monkeypatch):
+    monkeypatch.setenv("CUSTOMER_ID", "test")
+    output_location = "s3://my bucket/path"
+    runner = default_runner.Runner(
+        _backfill_runner_args(repo, output_location=output_location),
+        "some.jar",
+    )
+    final_args = runner._gen_final_args()
+    assert f"--output-location={shlex.quote(output_location)}" in final_args
+
+
+def test_gen_final_args_omits_output_location_when_unset(repo, monkeypatch):
+    monkeypatch.setenv("CUSTOMER_ID", "test")
+    runner = default_runner.Runner(_backfill_runner_args(repo), "some.jar")
+    final_args = runner._gen_final_args()
+    assert "--output-location" not in final_args

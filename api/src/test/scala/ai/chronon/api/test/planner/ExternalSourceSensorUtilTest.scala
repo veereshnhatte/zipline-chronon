@@ -2,6 +2,7 @@ package ai.chronon.api.test.planner
 
 import ai.chronon.api.planner.ExternalSourceSensorUtil
 import ai.chronon.api._
+import ai.chronon.api.Extensions.WindowUtils
 import ai.chronon.planner.ExternalSourceSensorNode
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
@@ -134,6 +135,42 @@ class ExternalSourceSensorUtilTest extends AnyFlatSpec with Matchers {
     sensor.metaData.executionInfo.outputTableInfo.partitionFormat should equal("yyyyMMdd")
   }
 
+  it should "overwrite stale downstream partition fields when sensor output table is overridden" in {
+    val dependencySpec = PartitionSpec("dt", "yyyyMMdd", 24 * 60 * 60 * 1000)
+    val downstreamSpec = PartitionSpec("ds", "yyyy-MM-dd-HH-mm", 60 * 60 * 1000)
+    val tableInfo = new TableInfo()
+      .setTable("data.events")
+      .setPartitionColumn(dependencySpec.column)
+      .setPartitionFormat(dependencySpec.format)
+      .setPartitionInterval(WindowUtils.fromMillis(dependencySpec.spanMillis))
+
+    val tableDep = new TableDependency().setTableInfo(tableInfo)
+
+    val downstreamOutput = new TableInfo()
+      .setTable("data.downstream")
+      .setPartitionColumn(downstreamSpec.column)
+      .setPartitionFormat(downstreamSpec.format)
+      .setPartitionInterval(WindowUtils.fromMillis(downstreamSpec.spanMillis))
+
+    val executionInfo = new ExecutionInfo()
+      .setOutputTableInfo(downstreamOutput)
+      .setTableDependencies(List(tableDep).asJava)
+
+    val metaData = new MetaData()
+      .setName("test_entity")
+      .setTeam("test_team")
+      .setVersion("1")
+      .setExecutionInfo(executionInfo)
+
+    val sensor = ExternalSourceSensorUtil.sensorNodes(metaData)(PartitionSpec.daily).head
+    val sensorTableInfo = sensor.metaData.executionInfo.outputTableInfo
+
+    sensorTableInfo.table should equal("data.events")
+    sensorTableInfo.partitionColumn should equal(dependencySpec.column)
+    sensorTableInfo.partitionFormat should equal(dependencySpec.format)
+    sensorTableInfo.partitionInterval should equal(WindowUtils.fromMillis(dependencySpec.spanMillis))
+  }
+
   "sensorNodes" should "create unique sensor names for complex table names" in {
     val tableInfo1 = new TableInfo()
       .setTable("namespace.complex_table_name")
@@ -173,6 +210,67 @@ class ExternalSourceSensorUtilTest extends AnyFlatSpec with Matchers {
     // Verify sensor names are unique
     val sensorNames = sensorNodes.map(_.metaData.name).toSet
     sensorNames should have size 2
+  }
+
+  "sensorNodes" should "give sensors distinct names when confs depend on the same table with different grids" in {
+    def metaDataFor(name: String, intervalMillis: Long, offsetMillis: Long): MetaData = {
+      val tableInfo = new TableInfo()
+        .setTable("data.table_a")
+        .setPartitionColumn("ds")
+        .setPartitionFormat("yyyy-MM-dd-HH-mm")
+        .setPartitionInterval(WindowUtils.fromMillis(intervalMillis))
+      if (offsetMillis != 0L) tableInfo.setPartitionOffset(WindowUtils.fromMillis(offsetMillis))
+      val executionInfo = new ExecutionInfo()
+        .setTableDependencies(List(new TableDependency().setTableInfo(tableInfo)).asJava)
+      new MetaData().setName(name).setTeam("test_team").setVersion("1").setExecutionInfo(executionInfo)
+    }
+
+    // Two confs watching the same table on different grids (a 3h@1h staging query and a 1d@1h
+    // groupBy) used to emit sensors with the SAME node name. branch_nodes keys nodes by name, so
+    // whichever conf synced last clobbered the other's sensor grid and the loser failed its
+    // partition-grid check every run.
+    val hourMillis = 60 * 60 * 1000L
+    val threeHourly =
+      ExternalSourceSensorUtil.sensorNodes(metaDataFor("test_team.sq__3", 3 * hourMillis, hourMillis)).head
+    val dailyOffset =
+      ExternalSourceSensorUtil.sensorNodes(metaDataFor("test_team.gb__1", 24 * hourMillis, hourMillis)).head
+
+    threeHourly.metaData.name should not equal dailyOffset.metaData.name
+    threeHourly.metaData.name shouldBe "data.table_a__3h-1h__sensor"
+    dailyOffset.metaData.name shouldBe "data.table_a__1d-1h__sensor"
+  }
+
+  it should "use the interval-only qualifier when the offset is zero" in {
+    val hourMillis = 60 * 60 * 1000L
+    val tableInfo = new TableInfo()
+      .setTable("data.table_a")
+      .setPartitionColumn("ds")
+      .setPartitionFormat("yyyy-MM-dd-HH-mm")
+      .setPartitionInterval(WindowUtils.fromMillis(3 * hourMillis))
+    val executionInfo = new ExecutionInfo()
+      .setTableDependencies(List(new TableDependency().setTableInfo(tableInfo)).asJava)
+    val metaData =
+      new MetaData().setName("test_team.sq__3").setTeam("test_team").setVersion("1").setExecutionInfo(executionInfo)
+
+    val sensor = ExternalSourceSensorUtil.sensorNodes(metaData).head
+    sensor.metaData.name shouldBe "data.table_a__3h__sensor"
+  }
+
+  it should "keep the legacy name for plain daily dependencies" in {
+    val tableInfo = new TableInfo()
+      .setTable("data.table_a")
+      .setPartitionColumn("ds")
+      .setPartitionFormat("yyyy-MM-dd")
+
+    val executionInfo = new ExecutionInfo()
+      .setTableDependencies(List(new TableDependency().setTableInfo(tableInfo)).asJava)
+    val metaData =
+      new MetaData().setName("test_team.gb__1").setTeam("test_team").setVersion("1").setExecutionInfo(executionInfo)
+
+    // Daily-no-offset is the overwhelmingly common case — its sensor names must not change, or
+    // every existing customer's sensors would be renamed on upgrade.
+    val sensor = ExternalSourceSensorUtil.sensorNodes(metaData).head
+    sensor.metaData.name shouldBe "data.table_a__sensor"
   }
 
   "sensorNodes" should "set correct sensor metadata for grouped dependencies" in {

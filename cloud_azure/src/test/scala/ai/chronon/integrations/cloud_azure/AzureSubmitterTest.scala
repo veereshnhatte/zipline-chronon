@@ -20,6 +20,7 @@ class AzureSubmitterTest extends AnyFlatSpec with Matchers with MockitoSugar {
       aksServiceAccount: Option[String] = Some("zipline-flink-sa"),
       aksNamespace: Option[String] = Some("zipline-flink"),
       ingressBaseUrl: Option[String] = None,
+      flinkUiProxyEnabled: Boolean = false,
       storageClient: Option[StorageClient] = None,
       flinkHealthCheckFn: Option[String] => Boolean = _ => true,
       flinkInternalJobIdFetchFn: Option[String] => Option[String] = _ => None
@@ -30,6 +31,7 @@ class AzureSubmitterTest extends AnyFlatSpec with Matchers with MockitoSugar {
       aksServiceAccount = aksServiceAccount,
       aksNamespace = aksNamespace,
       ingressBaseUrl = ingressBaseUrl,
+      flinkUiProxyEnabled = flinkUiProxyEnabled,
       storageClient = storageClient,
       flinkHealthCheckFn = flinkHealthCheckFn,
       flinkInternalJobIdFetchFn = flinkInternalJobIdFetchFn
@@ -425,12 +427,11 @@ class AzureSubmitterTest extends AnyFlatSpec with Matchers with MockitoSugar {
     healthCheckCalled shouldBe false
   }
 
-  it should "pass flink URL from ingressBaseUrl to the health check fn" in {
+  it should "pass the jobId to the health check fn" in {
     val mockAksFlink = mock[K8sFlinkSubmitter]
     var capturedUrl: Option[String] = None
     val submitter = createSubmitter(
       mockAksFlink = mockAksFlink,
-      ingressBaseUrl = Some("https://hub.example.com"),
       flinkHealthCheckFn = url => { capturedUrl = url; true }
     )
 
@@ -438,7 +439,7 @@ class AzureSubmitterTest extends AnyFlatSpec with Matchers with MockitoSugar {
       .thenReturn((JobStatusType.RUNNING, Some(java.time.Instant.now())))
 
     submitter.status("flink:ns:my-dep")
-    capturedUrl shouldBe Some("https://hub.example.com/flink/my-dep/")
+    capturedUrl shouldBe Some("flink:ns:my-dep")
   }
 
   // --- kill ---
@@ -474,6 +475,13 @@ class AzureSubmitterTest extends AnyFlatSpec with Matchers with MockitoSugar {
   it should "strip trailing slash from ingressBaseUrl before appending path" in {
     val submitter = createSubmitter(ingressBaseUrl = Some("https://hub.example.com/"))
     submitter.getFlinkUrl("flink:ns:my-deploy") shouldBe Some("https://hub.example.com/flink/my-deploy/")
+  }
+
+  it should "return services proxy URL when Flink UI proxy mode is enabled" in {
+    val submitter = createSubmitter(ingressBaseUrl = Some("https://hub.example.com/services/hub/"),
+                                    flinkUiProxyEnabled = true)
+    submitter.getFlinkUrl("flink:ns:my-deploy") shouldBe Some(
+      "https://hub.example.com/services/hub/engines/flink/job/my-deploy")
   }
 
   it should "return None when ingressBaseUrl is not set" in {

@@ -58,6 +58,13 @@ struct Query {
     **/
     25: optional bool timePartitioned
 
+    /**
+    * Offset from the UTC epoch/day boundary used when interpreting partitionInterval.
+    * For example, a 3-hour source partitioned at 01:00, 04:00, ... should set
+    * partitionInterval=3h and partitionOffset=1h.
+    **/
+    26: optional common.Window partitionOffset
+
 }
  
 /**
@@ -384,6 +391,18 @@ struct GroupBy {
     5: optional Accuracy accuracy
     // support for offline only for now
     7: optional list<Derivation> derivations
+    // Restricts batch uploads to keys present in this entity source's snapshot partition of the
+    // upload date. The filter's query.selects must produce columns named after (a subset of)
+    // keyColumns; the aggregated output (one row per key) is semi-joined against the distinct
+    // key tuples. Whole-key filtering commutes with per-key aggregation, so filtering after
+    // aggregation is equivalent and avoids joining the raw input against a large filter.
+    // Only applied by GroupByUpload to shrink upload size. GroupBy backfills and the
+    // join -> joinPart -> groupBy path ignore it (there the join's left side already restricts
+    // which keys get scanned). It is excluded from semantic hashing (like topics), so
+    // setting/changing it never re-triggers jobs.
+    // NOTE: for TEMPORAL groupBys with a streaming topic, the streaming job still writes all keys,
+    // so filtered-out keys may serve partial streaming-only aggregates instead of nulls.
+    8: optional EntitySource keyFilter
 }
 
 struct JoinPart {
@@ -481,6 +500,17 @@ struct GroupByServingInfo {
     //       2. batch_upload_lag = batch_upload_time - batch_data_time
     5: optional string batchEndDate
     6: optional string dateFormat
+
+    // partitionInterval and partitionOffset of the upload partition grid; absent means daily at midnight UTC
+    7: optional common.Window partitionInterval
+    8: optional common.Window partitionOffset
+
+    /**
+    * Authoritative watermark of the last upload: the exact epoch boundary (exclusive) the batch
+    * data covers up to. Streaming events at or after this timestamp are merged in by the fetcher.
+    * When absent, derived by parsing batchEndDate with dateFormat under a daily spec.
+    **/
+    9: optional i64 batchEndTs
 }
 
 // DataKind + TypeParams = DataType
@@ -539,6 +569,7 @@ struct Team {
     20: optional common.EnvironmentVariables env
     21: optional common.ConfigProperties conf
     22: optional common.ClusterConfigProperties clusterConf
+    23: optional common.ExecutionInfo executionInfo
 
 }
 

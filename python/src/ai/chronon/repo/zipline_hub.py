@@ -11,6 +11,20 @@ from ai.chronon.cli.theme import print_error, print_info, print_warning
 from ai.chronon.repo import utils
 
 
+def _format_hub_partition(value, default_value):
+    if value is None:
+        return default_value
+    if isinstance(value, datetime):
+        if value.second != 0 or value.microsecond != 0:
+            raise ValueError(f"Hub partition {value} must be aligned to minute precision")
+        if value.time() == datetime.min.time():
+            return value.strftime("%Y-%m-%d")
+        return value.strftime("%Y-%m-%d-%H-%M")
+    if isinstance(value, date):
+        return value.strftime("%Y-%m-%d")
+    return str(value)
+
+
 class ZiplineHub:
     def __init__(
         self,
@@ -463,6 +477,66 @@ class ZiplineHub:
             print_error(f"Error deploying schedules: {self._get_error_details(e)}", format=self.format)
             raise e
 
+    def call_schedule_list_api(self, branch: str, limit: int = 10000) -> dict:
+        """
+        List schedules known to the hub for a branch.
+
+        Returns:
+            dict with:
+                - schedules: list[dict] with per-schedule state (confName, branch, mode, state, ...)
+                - totalCount: int
+        """
+        url = f"{self.base_url}/schedule/v2/schedules"
+
+        try:
+            response = requests.get(
+                url,
+                params={"branch": branch, "limit": limit},
+                headers=self.additional_headers(self.base_url),
+            )
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.JSONDecodeError as e:
+            print_error(
+                f"Error listing schedules: Invalid JSON response\n"
+                f"Response status: {response.status_code}\n"
+                f"Response text: {response.text[:500]}",
+                format=self.format
+            )
+            raise e
+        except requests.RequestException as e:
+            self.handle_unauth(e, "schedule list")
+            print_error(f"Error listing schedules: {self._get_error_details(e)}", format=self.format)
+            raise e
+
+    def call_schedule_delete_api(self, conf_name: str, branch: str) -> dict:
+        """Delete the hub schedules registered for a conf name."""
+        url = f"{self.base_url}/schedule/v2/schedules"
+
+        try:
+            response = requests.delete(
+                url,
+                json={"confName": conf_name, "branch": branch},
+                headers=self.additional_headers(self.base_url),
+            )
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.JSONDecodeError as e:
+            print_error(
+                f"Error deleting schedule for {conf_name}: Invalid JSON response\n"
+                f"Response status: {response.status_code}\n"
+                f"Response text: {response.text[:500]}",
+                format=self.format
+            )
+            raise e
+        except requests.RequestException as e:
+            self.handle_unauth(e, "schedule delete")
+            print_error(
+                f"Error deleting schedule for {conf_name}: {self._get_error_details(e)}",
+                format=self.format,
+            )
+            raise e
+
     def call_cancel_api(self, workflow_id):
         url = f"{self.base_url}/workflow/v2/{workflow_id}/cancel"
 
@@ -646,12 +720,8 @@ class ZiplineHub:
         concurrency=None,
     ):
         url = f"{self.base_url}/workflow/v2/start"
-        end_dt = end.strftime("%Y-%m-%d") if end else date.today().strftime("%Y-%m-%d")
-        start_dt = (
-            start.strftime("%Y-%m-%d")
-            if start
-            else (date.today() - timedelta(days=14)).strftime("%Y-%m-%d")
-        )
+        end_dt = _format_hub_partition(end, date.today().strftime("%Y-%m-%d"))
+        start_dt = _format_hub_partition(start, (date.today() - timedelta(days=14)).strftime("%Y-%m-%d"))
         workflow_request = {
             "confName": conf_name,
             "confHash": conf_hash,
@@ -685,8 +755,8 @@ class ZiplineHub:
 
     def preview_clear_downstream(self, conf_name, branch, user, start, end):
         url = f"{self.base_url}/workflow/v2/clear-downstream/preview"
-        start_dt = start.strftime("%Y-%m-%d") if start else None
-        end_dt = end.strftime("%Y-%m-%d") if end else None
+        start_dt = _format_hub_partition(start, None)
+        end_dt = _format_hub_partition(end, None)
         clear_request = {
             "confName": conf_name,
             "branch": branch,
@@ -713,14 +783,18 @@ class ZiplineHub:
             print_error(f"Error calling clear-downstream preview API: {self._get_error_details(e)}", format=self.format)
             raise e
 
-    def apply_clear_downstream(self, node_results, user, affected_confs=None):
+    def apply_clear_downstream(self, conf_name, branch, user, start, end):
+        # Apply takes the same inputs as preview; the hub recomputes the downstream set and persists it.
         url = f"{self.base_url}/workflow/v2/clear-downstream/apply"
+        start_dt = _format_hub_partition(start, None)
+        end_dt = _format_hub_partition(end, None)
         apply_request = {
-            "nodeResults": node_results,
+            "confName": conf_name,
+            "branch": branch,
             "user": user,
+            "start": start_dt,
+            "end": end_dt,
         }
-        if affected_confs:
-            apply_request["affectedConfs"] = affected_confs
         try:
             response = requests.post(
                 url, json=apply_request, headers=self.additional_headers(self.base_url)
