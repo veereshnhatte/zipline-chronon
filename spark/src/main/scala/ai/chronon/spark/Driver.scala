@@ -534,11 +534,13 @@ object Driver {
     }
 
     def run(args: Args): Unit = {
-      GroupByUpload.run(parseConf[api.GroupBy](args.confPath()),
-                        args.endDate(),
-                        Some(args.buildTableUtils()),
-                        jsonPercent = args.jsonPercent.apply(),
-                        outputLocation = args.outputLocation.toOption)
+      GroupByUpload.run(
+        parseConf[api.GroupBy](args.confPath()),
+        args.endDate(),
+        Some(args.buildTableUtils()),
+        jsonPercent = args.jsonPercent.apply(),
+        outputLocation = args.outputLocation.toOption
+      )
     }
   }
 
@@ -898,7 +900,9 @@ object Driver {
         .setEndDate(endDate)
 
       // Run the SourceJob
-      val sourceJob = new SourceJob(sourceWithFilterNode, sourceMetaData, dateRange, outputLocation = args.outputLocation.toOption)(tableUtils)
+      val sourceJob =
+        new SourceJob(sourceWithFilterNode, sourceMetaData, dateRange, outputLocation = args.outputLocation.toOption)(
+          tableUtils)
       sourceJob.run()
 
       logger.info(s"SourceJob completed. Output table: ${outputTable}")
@@ -960,7 +964,11 @@ object Driver {
         .setEndDate(endDate)
 
       // Run the JoinPartJob
-      val joinPartJob = new JoinPartJob(joinPartNode, metadata, dateRange, showDf = false, outputLocation = args.outputLocation.toOption)(tableUtils)
+      val joinPartJob = new JoinPartJob(joinPartNode,
+                                        metadata,
+                                        dateRange,
+                                        showDf = false,
+                                        outputLocation = args.outputLocation.toOption)(tableUtils)
       joinPartJob.run()
 
       logger.info(s"JoinPartJob completed. Output table: ${metadata.outputTable}")
@@ -1004,7 +1012,9 @@ object Driver {
       val mergeNode = new JoinMergeNode()
         .setJoin(joinConf)
 
-      val mergeJob = new MergeJob(mergeNode, mergeMetaData, dateRange, allJoinParts, outputLocation = args.outputLocation.toOption)(tableUtils)
+      val mergeJob =
+        new MergeJob(mergeNode, mergeMetaData, dateRange, allJoinParts, outputLocation = args.outputLocation.toOption)(
+          tableUtils)
 
       mergeJob.run()
 

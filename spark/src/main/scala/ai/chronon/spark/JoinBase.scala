@@ -237,8 +237,7 @@ abstract class JoinBase(val joinConfCloned: api.Join,
                        bootstrapInfo: BootstrapInfo,
                        outputLocation: Option[String] = None): Unit
 
-  def computeFinal(overrideStartPartition: Option[String] = None,
-                   outputLocation: Option[String] = None): Unit = {
+  def computeFinal(overrideStartPartition: Option[String] = None, outputLocation: Option[String] = None): Unit = {
 
     // Utilizes the same tablesToRecompute check as the monolithic spark job, because if any joinPart changes, then so does the output table
     if (tablesToRecompute(joinConfCloned, outputTable, tableUtils).isEmpty) {
